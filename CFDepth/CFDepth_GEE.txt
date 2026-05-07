@@ -1,0 +1,270 @@
+/*******************************
+ * CFDepth GEE open-source version
+ *
+ * Input:
+ *   image: uploaded 0/1 flood GeoTIFF from Google Earth Engine Imports.
+ *   1 = flood and 0 = background.
+ *
+ * Workflow:
+ *   1) Build a compact AOI from flood pixels.
+ *   2) Load FABDEM and align the flood support to the DEM grid.
+ *   3) Build a FwDET-style base water surface.
+ *   4) Repair unresolved depths with lowest feasible boundary surfaces.
+ *   5) Propagate valid water surfaces and export the final CFDepth layer.
+ *******************************/
+
+var floodRaw = ee.Image(image).select(0).rename('flood_raw');
+
+var exportName = 'CFDepth';
+var exportFolder = 'FloodDepth';
+
+var repairMode = 'LOWEST_BOUNDARY_THEN_PROPAGATE';
+var minPositiveDepth = 0.01;
+var feasibleEpsilon = 0.05;
+var fallbackRadiiPixels = [1, 2, 3, 5, 8];
+var propagationIterations = 10;
+var propagationRadiusPixels = 1;
+var push = 5000;
+var aoiBufferMeters = 1000;
+var aoiDetectionScale = 30;
+var depthVis = {
+  min: 0,
+  max: 5,
+  palette: ['white', 'blue', 'purple']
+};
+
+var flood01Raw = floodRaw.gt(0).toByte().rename('flood01_raw');
+var floodMaskedRaw = flood01Raw.selfMask();
+var floodLonLat = ee.Image.pixelLonLat().updateMask(floodMaskedRaw);
+
+var floodBoundsDict = floodLonLat.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: floodRaw.geometry(),
+  scale: aoiDetectionScale,
+  maxPixels: 1e13,
+  bestEffort: true,
+  tileScale: 4
+});
+
+var floodBounds = ee.Geometry.Rectangle([
+  ee.Number(floodBoundsDict.get('longitude_min')),
+  ee.Number(floodBoundsDict.get('latitude_min')),
+  ee.Number(floodBoundsDict.get('longitude_max')),
+  ee.Number(floodBoundsDict.get('latitude_max'))
+], null, false);
+
+var aoi = floodBounds.buffer(aoiBufferMeters).bounds();
+
+var demCol = ee.ImageCollection('projects/sat-io/open-datasets/FABDEM')
+  .filterBounds(aoi);
+
+var firstTile = ee.Image(demCol.first()).select(0);
+var demProj = firstTile.projection();
+var demScale = demProj.nominalScale();
+
+var dem = demCol
+  .mosaic()
+  .select(0)
+  .rename('dem')
+  .setDefaultProjection(demProj)
+  .clip(aoi);
+
+var floodBinary = flood01Raw
+  .clip(aoi)
+  .reduceResolution({
+    reducer: ee.Reducer.max(),
+    bestEffort: true,
+    maxPixels: 4096
+  })
+  .reproject(demProj)
+  .unmask(0)
+  .toByte()
+  .rename('flood_binary');
+
+var flood = floodBinary
+  .selfMask()
+  .rename('flood');
+
+function localLowestFeasible(sourceElev, targetDem, radiusPixels, epsilon, outName) {
+  var highSentinel = 1e9;
+
+  var kernel = ee.Kernel.square({
+    radius: radiusPixels,
+    units: 'pixels',
+    normalize: false
+  });
+
+  var neighborBands = sourceElev
+    .unmask(highSentinel)
+    .neighborhoodToBands(kernel);
+
+  var threshold = targetDem.add(epsilon);
+
+  var feasibleBands = neighborBands.where(
+    neighborBands.lte(threshold),
+    highSentinel
+  );
+
+  var lowest = feasibleBands
+    .reduce(ee.Reducer.min())
+    .rename(outName);
+
+  return lowest.updateMask(lowest.lt(highSentinel));
+}
+
+var outsideDem = dem.updateMask(floodBinary.eq(0));
+var source = outsideDem.mask();
+var val = 10000;
+
+var cost0 = ee.Image.constant(val)
+  .clip(aoi)
+  .where(source, 0)
+  .cumulativeCost(source, push);
+
+var cost1 = ee.Image.constant(val)
+  .clip(aoi)
+  .where(source, 1)
+  .cumulativeCost(source, push);
+
+var cost2 = outsideDem
+  .unmask(val)
+  .clip(aoi)
+  .cumulativeCost(source, push);
+
+var costFill = cost2
+  .subtract(cost0)
+  .divide(cost1.subtract(cost0));
+
+var baseSurface = outsideDem
+  .unmask(0)
+  .clip(aoi)
+  .add(costFill)
+  .rename('base_surface');
+
+var baseDepthRaw = baseSurface
+  .subtract(dem)
+  .rename('base_depth_raw');
+
+var baseDepthFlag = baseDepthRaw.unmask(-99999);
+
+var unresolved0 = floodBinary.eq(1)
+  .and(baseDepthFlag.lte(minPositiveDepth))
+  .rename('unresolved_initial');
+
+var surfaceSentinel = -99999;
+
+var surface0 = baseSurface
+  .unmask(surfaceSentinel)
+  .rename('surface0');
+
+var surface1 = surface0;
+
+if (repairMode == 'LOWEST_BOUNDARY_THEN_PROPAGATE') {
+  var outerBoundary = floodBinary
+    .focal_max(1, 'square', 'pixels')
+    .subtract(floodBinary)
+    .gt(0)
+    .selfMask()
+    .rename('outer_boundary');
+
+  var boundaryElev = dem
+    .updateMask(outerBoundary)
+    .rename('boundary_elev');
+
+  var fallbackSurface = ee.Image.constant(surfaceSentinel)
+    .rename('fallback_surface');
+
+  var unresolved1 = unresolved0;
+
+  fallbackRadiiPixels.forEach(function(px) {
+    var localBoundaryLowest = localLowestFeasible(
+      boundaryElev,
+      dem,
+      px,
+      feasibleEpsilon,
+      'lowest_boundary_' + px
+    );
+
+    var feasible = unresolved1.and(localBoundaryLowest.mask());
+
+    fallbackSurface = fallbackSurface.where(
+      feasible,
+      localBoundaryLowest
+    );
+
+    unresolved1 = unresolved1.and(feasible.not());
+  });
+
+  var rescuedByBoundary = unresolved0
+    .and(fallbackSurface.neq(surfaceSentinel));
+
+  surface1 = surface0
+    .where(rescuedByBoundary, fallbackSurface)
+    .rename('surface_after_boundary');
+}
+
+var surface2 = surface1.rename('surface_before_propagation');
+
+for (var j = 0; j < propagationIterations; j++) {
+  var currentDepth = surface2.subtract(dem);
+
+  var validSurface = surface2.updateMask(
+    currentDepth.gt(minPositiveDepth)
+      .and(floodBinary.eq(1))
+  );
+
+  var neighborLowestSurface = localLowestFeasible(
+    validSurface,
+    dem,
+    propagationRadiusPixels,
+    feasibleEpsilon,
+    'neighbor_lowest_surface_' + j
+  );
+
+  var canFill = floodBinary.eq(1)
+    .and(currentDepth.lte(minPositiveDepth))
+    .and(neighborLowestSurface.mask());
+
+  surface2 = surface2
+    .where(canFill, neighborLowestSurface)
+    .rename('surface_propagated_' + j);
+}
+
+var finalDepthRaw = surface2
+  .subtract(dem)
+  .rename('final_depth_raw');
+
+var finalDepth = finalDepthRaw
+  .max(0)
+  .updateMask(flood)
+  .rename('CFDepth');
+
+var finalDepthDisplay = finalDepth
+  .updateMask(finalDepth.gt(minPositiveDepth));
+
+Map.setOptions('HYBRID');
+Map.centerObject(aoi, 10);
+
+Map.addLayer(
+  flood,
+  {palette: ['red']},
+  'flood extent',
+  false
+);
+
+Map.addLayer(
+  finalDepthDisplay,
+  depthVis,
+  'CFDepth final depth',
+  true
+);
+
+Export.image.toDrive({
+  image: finalDepth,
+  description: exportName,
+  folder: exportFolder,
+  fileNamePrefix: exportName,
+  region: aoi,
+  scale: demScale,
+  maxPixels: 1e13
+});
